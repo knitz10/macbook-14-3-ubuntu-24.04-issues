@@ -4,9 +4,9 @@ A self-contained bundle for running **tiny-dfr** on a MacBook Pro Touch Bar (T1,
 
 ## Disclaimer
 
-This repository is mostly AI-generated.
+This repository is mostly AI-generated, all the scripts, etc.
 
-"i mostly just did research and put it into the chatbot, as i am not experienced with linux enough and don't know rust at all, and i didn't have time to try to figure everything out because i needed the laptop for school."
+I mostly just did research and put it into the chatbot, as I am not experienced with linux enough and don't know rust at all, and I didn't have time to try to figure everything out because I needed the laptop for school. As shameful as it is for me to have such a repository here publicly on my profile, I want to help those that might have such issues, so they don't have to go through what I did. I'll try to do better next time, sorry. °^°
 
 ## Quick start
 
