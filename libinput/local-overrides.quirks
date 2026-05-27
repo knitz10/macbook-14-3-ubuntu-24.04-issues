@@ -1,0 +1,5 @@
+[MacBookPro Touch Bar]
+MatchBus=usb
+MatchVendor=0x05AC
+MatchProduct=0x8600
+AttrKeyboardIntegration=internal

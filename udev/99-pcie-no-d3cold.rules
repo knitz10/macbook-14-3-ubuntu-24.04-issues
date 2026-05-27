@@ -1,0 +1,16 @@
+# Prevent BCM43602 WiFi (brcmfmac, 14e4:43ba) and its Intel PCIe root port
+# (8086:a110) from entering D3cold during system suspend.
+#
+# Without this, s2idle physically cuts power to the PCIe slot. On resume,
+# brcmfmac fails with:
+#   "Unable to change power state from D3cold to D0, device inaccessible"
+#   "brcmf_pcie_pm_leave_D3: probe after resume failed, err=-19"
+#
+# D3cold = PCIe slot power cut.  D3hot = power stays, safe to resume.
+# Setting d3cold_allowed=0 keeps both devices at D3hot at worst.
+
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x14e4", ATTR{device}=="0x43ba", \
+    ATTR{d3cold_allowed}="0"
+
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", ATTR{device}=="0xa110", \
+    ATTR{d3cold_allowed}="0"

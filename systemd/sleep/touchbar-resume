@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# /etc/systemd/system-sleep/touchbar-resume
+#
+# Reinitialise the Touch Bar after resume.
+#
+# tiny-dfr already has Restart=always and StartLimitIntervalSec=0, so it
+# auto-recovers when appletbdrm re-registers its DRM device after USB
+# re-enumeration. We do NOT stop tiny-dfr before suspend — stopping it
+# causes it to be unavailable for longer than just letting it auto-restart.
+#
+# What we DO need on resume: the T1 USB chip stays in config 2 across
+# s2idle (USB stays powered), but the DRM device may take a moment to
+# re-register. tiny-dfr's auto-restart handles that race fine on its own.
+#
+# This hook exists only as a safety net for cases where appletbdrm doesn't
+# re-register without a manual module cycle.
+
+case "$1" in
+  post)
+    sleep 3
+
+    # Find Touch Bar DRM card (appletbdrm) if it is already registered.
+    tb_card=""
+    for c in /sys/class/drm/card[0-9]*; do
+      [ -e "$c" ] || continue
+      drv="$(readlink -f "$c/device/driver" 2>/dev/null || true)"
+      case "$drv" in
+        */appletbdrm)
+          tb_card="${c##*/}"
+          break
+          ;;
+      esac
+    done
+
+    # If no appletbdrm card exists yet, nudge USB config + module cycle.
+    if [ -z "$tb_card" ]; then
+      echo 2 > /sys/bus/usb/devices/1-3/bConfigurationValue 2>/dev/null || true
+      sleep 1
+      modprobe -r appletbdrm 2>/dev/null || true
+      sleep 1
+      modprobe appletbdrm    2>/dev/null || true
+    fi
+
+    # Restore Touch Bar backlight if it got stuck at zero after resume.
+    if [ -r /sys/class/backlight/appletb_backlight/max_brightness ] && \
+       [ -w /sys/class/backlight/appletb_backlight/brightness ]; then
+      max_bl="$(cat /sys/class/backlight/appletb_backlight/max_brightness 2>/dev/null || echo 255)"
+      cur_bl="$(cat /sys/class/backlight/appletb_backlight/brightness 2>/dev/null || echo 0)"
+      if [ "${cur_bl:-0}" -eq 0 ]; then
+        target_bl=$(( max_bl / 2 ))
+        [ "$target_bl" -lt 32 ] && target_bl=32
+        [ "$target_bl" -gt "$max_bl" ] && target_bl="$max_bl"
+        echo "$target_bl" > /sys/class/backlight/appletb_backlight/brightness 2>/dev/null || true
+      fi
+    fi
+
+    # Reset failure state so Restart=always can take over immediately
+    systemctl reset-failed tiny-dfr.service 2>/dev/null || true
+    systemctl restart tiny-dfr.service 2>/dev/null || true
+    ;;
+esac
+
+exit 0

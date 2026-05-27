@@ -1,0 +1,9 @@
+# Prefer distro packages on Ubuntu/Debian:
+#   sudo apt install python3-tomlkit python3-cairosvg python3-pil.imagetk
+#
+# Or a venv in this directory:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#   .venv/bin/python touchbar-layout-editor.py
+tomlkit>=0.12.0
+Pillow>=10.0.0
+cairosvg>=2.7.0

@@ -1,0 +1,7 @@
+# Apple T1/T2 iBridge (05ac:8600) - switch to USB config 2 to expose DRM
+# bulk endpoints (ep_85 IN, ep_02 OUT) needed by appletbdrm.
+# bDeviceClass is 0xef (Miscellaneous/composite), NOT 0x00.
+SUBSYSTEM=="usb", ACTION=="add", \
+    ATTR{idVendor}=="05ac", ATTR{idProduct}=="8600", \
+    ATTR{bConfigurationValue}=="1", \
+    ATTR{bConfigurationValue}="2"

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# /etc/systemd/system-sleep/wifi-resume
+#
+# Reconnect WiFi after resume.
+# The D3cold hard-crash is prevented by 99-pcie-no-d3cold.rules (d3cold_allowed=0).
+# With the device staying in D3hot, NetworkManager just needs to re-enable
+# networking after s2idle.
+
+case "$1" in
+  pre)
+    nmcli networking off 2>/dev/null || true
+    ;;
+  post)
+    sleep 2
+    nmcli networking on 2>/dev/null || true
+    ;;
+esac
+
+exit 0

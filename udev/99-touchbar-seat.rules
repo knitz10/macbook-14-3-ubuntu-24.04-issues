@@ -1,0 +1,6 @@
+# Assign Touch Bar touch input to seat-touchbar so the compositor (seat0) ignores it
+# and tiny-dfr handles touch events instead.
+# Do NOT override ID_INPUT_TOUCHSCREEN here — 98-touchbar-fake.rules sets it to 1
+# so libinput generates TouchEvent (not PointerEvent) for this device.
+SUBSYSTEM=="input", ATTRS{name}=="Apple Inc. iBridge Touchpad", \
+    ENV{ID_SEAT}="seat-touchbar"
