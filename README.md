@@ -6,7 +6,9 @@ A self-contained bundle for running **tiny-dfr** on a MacBook Pro Touch Bar (T1,
 
 This repository is mostly AI-generated, all the scripts, etc.
 
-I mostly just did research and put it into the chatbot, as I am not experienced with linux enough and don't know rust at all, and I didn't have time to try to figure everything out because I needed the laptop for school. As shameful as it is for me to have such a repository here publicly on my profile, I want to help those that might have such issues, so they don't have to go through what I did. I'll try to do better next time, sorry. °^°
+I mostly just did research and put it into the chatbot, as I am not experienced with Linux n stuff enough and don't know Rust or C at all, and I didn't have time to try to figure everything out because I needed the laptop for school. As shameful as it is for me to have such a repository here publicly on my profile, I want to help those that might have such issues, so they don't have to go through what I did. I'll try to do better next time, sorry. °^°
+
+Also, if any creators of modified programs want me to take their stuff down, please reach out to me, you can reach out by [creating an issue](https://github.com/knitz10/macbook-14-3-ubuntu-24.04-issues/issues/new), or you can reach out to me via [e-mail](mailto:antoni@knycz.net).
 
 ## Quick start
 
