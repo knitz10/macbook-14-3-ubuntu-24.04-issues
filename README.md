@@ -56,3 +56,7 @@ cd tools && ./run-layout-editor.sh
 
 - **[FIX.md](FIX.md)** — How to install, verify, and recover when something breaks.
 - **[CONTEXT.md](CONTEXT.md)** — Deep background: T1 vs T2, USB configs, DRM, input, resources.
+
+
+
+<sub><sup>Also, uhh, I'm not responsible for any damage done to your hardware, okay? Although generally it should work just fine, if anything bad happens and isn't mentioned here, sorry, you're on your own. Just, you know, be careful with what you do in general...</sub></sup>
