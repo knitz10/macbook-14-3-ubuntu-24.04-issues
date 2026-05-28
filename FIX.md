@@ -134,6 +134,7 @@ sudo udevadm control --reload-rules
 sudo bash -c 'echo 0 > /sys/bus/pci/devices/0000:03:00.0/d3cold_allowed'
 sudo bash -c 'echo 0 > /sys/bus/pci/devices/0000:00:1c.0/d3cold_allowed'
 ```
+If the tiny-dfr resume script doesn't work(as in, doesn't make the touchbar light up as it should), try running "sudo nohup tiny-dfr &" in the terminal.
 
 ## After reboot — verify
 
