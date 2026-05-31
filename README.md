@@ -58,6 +58,7 @@ cd tools && ./run-layout-editor.sh
 
 You can now edit the layout using "tiny-dfr edit". You need to have python3 installed, and it will tell you the install commands for its dependencies. It's not the most beautiful editor but I didn't wanna touch it because I have 0 experience with tkinter and 0 time to learn it. You can add custom buttons with commands, additional bars, it's great, really. Strongly recommend. It looks like it's a prototype, and that's because it is, I don't have the time to try to properly finish it - even using ai, but it mostly works, it's just ugly.
 
+Oh and don't mind the App layer 1, 2 and 3, if you see them. They don't work. Well, at least I don't think they do. Just make new custom bars yourself.
 
 ## Docs
 
