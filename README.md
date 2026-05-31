@@ -54,6 +54,11 @@ cd tools && ./run-layout-editor.sh
 | [FIX.md](FIX.md) | Step-by-step fix guide |
 | [CONTEXT.md](CONTEXT.md) | Architecture, history, links |
 
+## How to edit the layout using tiny-dfr
+
+You can now edit the layout using "tiny-dfr edit". You need to have python3 installed, and it will tell you the install commands for its dependencies. It's not the most beautiful editor but I didn't wanna touch it because I have 0 experience with tkinter and 0 time to learn it. You can add custom buttons with commands, additional bars, it's great, really. Strongly recommend. It looks like it's a prototype, and that's because it is, I don't have the time to try to properly finish it - even using ai, but it mostly works, it's just ugly.
+
+
 ## Docs
 
 - **[FIX.md](FIX.md)** — How to install, verify, and recover when something breaks.
