@@ -1,15 +1,21 @@
 use std::{
+    env,
     fs::{File, OpenOptions},
+    io::ErrorKind,
     os::{
         fd::{AsRawFd, AsFd},
-        unix::{io::OwnedFd, fs::OpenOptionsExt}
+        unix::{io::OwnedFd, fs::{OpenOptionsExt, PermissionsExt}, net::UnixDatagram}
     },
     path::{Path, PathBuf},
     collections::HashMap,
     cmp::min,
     panic::{self, AssertUnwindSafe},
+    process::{self, Command},
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+    time::{Duration, Instant},
 };
-use cairo::{ImageSurface, Format, Context, Surface, Rectangle, FontSlant, FontWeight, Antialias};
+use cairo::{ImageSurface, Format, Context, Surface, Rectangle, Antialias};
 use rsvg::{Loader, CairoRenderer, SvgHandle};
 use drm::control::ClipRect;
 use anyhow::{Result, anyhow};
@@ -39,12 +45,14 @@ mod backlight;
 mod display;
 mod pixel_shift;
 mod fonts;
+mod text_render;
 mod config;
 
 use backlight::BacklightManager;
 use display::{DrmBackend, DrmRedrawHandle};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
-use config::{ButtonConfig, Config};
+use config::{ButtonConfig, Config, FnMode, KeyboardModifiers};
+use text_render::{LabelFonts, show_label_centered};
 use crate::config::ConfigManager;
 
 const BUTTON_SPACING_PX: i32 = 16;
@@ -67,22 +75,91 @@ struct Button {
     changed: bool,
     active: bool,
     action: Key,
+    command: Option<String>,
+    switch_to_layer: Option<usize>,
     background: bool
 }
 
-fn load_image(icon_name: &str, mode: Option<String>, path: &str) -> Result<ButtonImage> {
-    if path != "use_default" {
-        return Err(anyhow!("Custom path defined, using that"));
+fn icon_name_candidates(icon_name: &str) -> Vec<String> {
+    let mut names = vec![icon_name.to_string()];
+    if !icon_name.ends_with("-symbolic") {
+        names.push(format!("{icon_name}-symbolic"));
     }
-    let theme = ConfigManager::new().load_theme();
-    let icon_theme = match mode {
-        Some(mode_val) => {
-            if mode_val == "App" {theme.app_icon_theme} else {theme.media_icon_theme}
+    let mut expanded = Vec::new();
+    for name in names {
+        expanded.push(name.clone());
+        if !name.ends_with(".svg") {
+            expanded.push(format!("{name}.svg"));
         }
-        None => {
-            panic!("No mode specified")
+        if !name.ends_with(".png") {
+            expanded.push(format!("{name}.png"));
         }
-    };
+    }
+    expanded
+}
+
+fn theme_icon_subdirs(theme: &str) -> Vec<Vec<String>> {
+    vec![
+        vec![],
+        vec![theme.into()],
+        vec![theme.into(), "symbolic".into()],
+        vec![theme.into(), "symbolic".into(), "status".into()],
+        vec![theme.into(), "symbolic".into(), "actions".into()],
+        vec![theme.into(), "symbolic".into(), "apps".into()],
+        vec!["hicolor".into(), "symbolic".into(), "status".into()],
+        vec!["hicolor".into(), "symbolic".into(), "actions".into()],
+        vec!["hicolor".into(), "symbolic".into(), "apps".into()],
+    ]
+}
+
+fn resolve_icon_path(icon_name: &str, icon_theme: &str) -> Option<PathBuf> {
+    let roots = [
+        "/etc/tiny-dfr/icons",
+        "/usr/share/tiny-dfr/icons",
+        "/usr/share/icons",
+        "/usr/share/pixmaps",
+    ];
+    for name in icon_name_candidates(icon_name) {
+        for root in roots {
+            for subdir in theme_icon_subdirs(icon_theme) {
+                let mut path = PathBuf::from(root);
+                for part in &subdir {
+                    path.push(part);
+                }
+                path.push(&name);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn button_image_from_path(path: &Path) -> Result<ButtonImage> {
+    let path_str = path.to_string_lossy();
+    if path_str.ends_with(".svg") {
+        let handle = Loader::new().read_path(path)?;
+        return Ok(ButtonImage::Svg(handle));
+    }
+    if path_str.ends_with(".png") {
+        let mut file = File::open(path)?;
+        let surf = ImageSurface::create_from_png(&mut file)?;
+        if surf.height() == ICON_SIZE && surf.width() == ICON_SIZE {
+            return Ok(ButtonImage::Bitmap(surf));
+        }
+        let resized = ImageSurface::create(Format::ARgb32, ICON_SIZE, ICON_SIZE).unwrap();
+        let c = Context::new(&resized).unwrap();
+        c.scale(ICON_SIZE as f64 / surf.width() as f64, ICON_SIZE as f64 / surf.height() as f64);
+        c.set_source_surface(surf, 0.0, 0.0).unwrap();
+        c.set_antialias(Antialias::Best);
+        c.paint().unwrap();
+        return Ok(ButtonImage::Bitmap(resized));
+    }
+    Err(anyhow!("Unsupported icon format: {}", path.display()))
+}
+
+fn load_image_via_icon_loader(icon_name: &str, icon_theme: &str) -> Result<ButtonImage> {
     let mut search_paths: Vec<PathBuf> = vec![
         PathBuf::from("/etc/tiny-dfr/icons"),
         PathBuf::from("/usr/share/tiny-dfr/icons/"),
@@ -93,53 +170,44 @@ fn load_image(icon_name: &str, mode: Option<String>, path: &str) -> Result<Butto
     loader.set_search_paths(search_paths);
     loader.set_theme_name_provider(icon_theme);
     loader.update_theme_name().unwrap();
-    let icon_loader;
-    match loader.load_icon(icon_name) {
-        Some(icon) => {
-            icon_loader = icon;
-        }
-        None => {
-            match loader.load_icon(format!("{}.svg", icon_name)) {
-                Some(icon) => {
-                    icon_loader = icon;
+    for name in icon_name_candidates(icon_name) {
+        if let Some(icon_loader) = loader.load_icon(&name) {
+            let icon = icon_loader.file_for_size(256);
+            return match icon.icon_type() {
+                IconFileType::SVG => {
+                    let handle = Loader::new().read_path(icon.path())?;
+                    Ok(ButtonImage::Svg(handle))
                 }
-                None => {
-                    match loader.load_icon(format!("{}.png", icon_name)) {
-                        Some(icon) => {
-                            icon_loader = icon;
-                        }
-                        None => {
-                            return Err(anyhow!("Icon not found: {}, trying /usr/share/pixmaps", icon_name));
-                        }
-                    }
-                }
-            }
-        }
-    };
-    let icon = icon_loader.file_for_size(256);
-    match icon.icon_type() {
-        IconFileType::SVG => {
-            let handle = Loader::new().read_path(icon.path())?;
-            Ok(ButtonImage::Svg(handle))
-        }
-        IconFileType::PNG => {
-            let mut file = File::open(icon.path())?;
-            let surf = ImageSurface::create_from_png(&mut file)?;
-            if surf.height() == ICON_SIZE && surf.width() == ICON_SIZE {
-                return Ok(ButtonImage::Bitmap(surf));
-            }
-            let resized = ImageSurface::create(Format::ARgb32, ICON_SIZE, ICON_SIZE).unwrap();
-            let c = Context::new(&resized).unwrap();
-            c.scale(ICON_SIZE as f64 / surf.width() as f64, ICON_SIZE as f64 / surf.height() as f64);
-            c.set_source_surface(surf, 0.0, 0.0).unwrap();
-            c.set_antialias(Antialias::Best);
-            c.paint().unwrap();
-            return Ok(ButtonImage::Bitmap(resized));
-        }
-        IconFileType::XPM => {
-            panic!("Legacy XPM icons are not supported")
+                IconFileType::PNG => button_image_from_path(icon.path()),
+                IconFileType::XPM => Err(anyhow!("Legacy XPM icons are not supported")),
+            };
         }
     }
+    Err(anyhow!("Icon not found in theme `{icon_theme}`: {icon_name}"))
+}
+
+fn load_image(icon_name: &str, mode: &Option<String>, path: &str) -> Result<ButtonImage> {
+    if path != "use_default" {
+        return Err(anyhow!("Custom path defined, using that"));
+    }
+    let theme = ConfigManager::new().load_theme();
+    let icon_theme = match mode {
+        Some(mode_val) => {
+            if mode_val == "App" {
+                theme.app_icon_theme
+            } else {
+                theme.media_icon_theme
+            }
+        }
+        None => {
+            panic!("No mode specified")
+        }
+    };
+    load_image_via_icon_loader(icon_name, &icon_theme).or_else(|loader_err| {
+        resolve_icon_path(icon_name, &icon_theme)
+            .ok_or(loader_err)
+            .and_then(|p| button_image_from_path(&p))
+    })
 }
 
 fn try_load_svg_path(icon_name: &str, path: &str) -> Result<ButtonImage> {
@@ -169,14 +237,10 @@ fn try_load_png_path(icon_name: &str, path: &str) -> Result<ButtonImage> {
 impl Button {
     fn with_config(cfg: ButtonConfig) -> Button {
         let background;
-        if let Some(text) = cfg.text {
-            if let Some(bg) = cfg.background {
-                background = bg;
-            } else {
-                background = true;
-            }
-            Button::new_text(text, cfg.action, background)
-        } else if let Some(icon) = cfg.icon {
+        let action = cfg.resolved_action();
+        let command = cfg.command;
+        let switch_to_layer = cfg.switch_to_layer;
+        if let Some(icon) = cfg.icon {
             let path = match cfg.path {
                 Some(p) => p,
                 None => "use_default".to_string()
@@ -194,7 +258,14 @@ impl Button {
                     panic!("Invalid config, a button must have either Text, Icon or be Blank")
                 }
             }
-            Button::new_icon(&icon, cfg.action, cfg.mode, &path, background)
+            Button::new_icon(&icon, action, cfg.mode, &path, background, command, switch_to_layer)
+        } else if let Some(text) = cfg.text {
+            if let Some(bg) = cfg.background {
+                background = bg;
+            } else {
+                background = true;
+            }
+            Button::new_text(text, action, background, command, switch_to_layer)
         } else if let Some(mode) = cfg.mode {
             if let Some(bg) = cfg.background {
                 background = bg;
@@ -202,7 +273,7 @@ impl Button {
                 background = false;
             }
             if mode.to_lowercase() == "blank" {
-                Button::new_blank(cfg.action, background)
+                Button::new_blank(action, background)
             } else if mode.to_lowercase() == "time" {
                 let format = match cfg.format {
                     Some(f) => f,
@@ -212,7 +283,7 @@ impl Button {
                     Some(l) => l,
                     None => "POSIX".to_string()
                 };
-                Button::new_time(cfg.action, format, locale, background)
+                Button::new_time(action, format, locale, background)
             } else {
                 panic!("Invalid config, a button must have either Text, Icon or be Blank")
             }
@@ -220,22 +291,29 @@ impl Button {
             panic!("Invalid config, a button must have either Text, Icon or be Blank")
         }
     }
-    fn new_text(text: String, action: Key, background: bool) -> Button {
+    fn new_text(text: String, action: Key, background: bool, command: Option<String>, switch_to_layer: Option<usize>) -> Button {
         Button {
             action,
+            command,
+            switch_to_layer,
             active: false,
             changed: false,
             image: ButtonImage::Text(text),
             background
         }
     }
-    fn new_icon(icon_name: &str, action: Key, mode: Option<String>, path: &str, background: bool) -> Button {
-        let image = load_image(icon_name, mode, path)
+    fn new_icon(icon_name: &str, action: Key, mode: Option<String>, path: &str, background: bool, command: Option<String>, switch_to_layer: Option<usize>) -> Button {
+        let image = load_image(icon_name, &mode, path)
             .or_else(|_| try_load_svg_path(icon_name, path))
             .or_else(|_| try_load_png_path(icon_name, path))
-            .unwrap_or_else(|_| ButtonImage::Text(icon_name.to_string()));
+            .unwrap_or_else(|err| {
+                eprintln!("tiny-dfr: failed to load icon `{icon_name}`: {err}");
+                ButtonImage::Text(icon_name.to_string())
+            });
         Button {
             action, image,
+            command,
+            switch_to_layer,
             active: false,
             changed: false,
             background
@@ -244,6 +322,8 @@ impl Button {
     fn new_time(action: Key, format: String, locale: String, background: bool) -> Button {
         Button {
             action,
+            command: None,
+            switch_to_layer: None,
             active: false,
             changed: false,
             image: ButtonImage::Time(format, locale),
@@ -253,26 +333,41 @@ impl Button {
     fn new_blank(action: Key, background: bool) -> Button {
         Button {
             action,
+            command: None,
+            switch_to_layer: None,
             active: false,
             changed: false,
             image: ButtonImage::Blank,
             background
         }
     }
-    fn render(&self, c: &Context, height: i32, button_left_edge: f64, button_width: u64, y_shift: f64) {
+    fn render(
+        &self,
+        c: &Context,
+        button_left_edge: f64,
+        button_width: u64,
+        label_top: f64,
+        label_bottom: f64,
+        y_shift: f64,
+        fonts: &LabelFonts<'_>,
+        font_size: f64,
+    ) {
         match &self.image {
             ButtonImage::Text(text) => {
-                let extents = c.text_extents(text).unwrap();
-                c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round()
+                show_label_centered(
+                    c,
+                    text,
+                    button_left_edge + button_width as f64 / 2.0,
+                    label_top + y_shift,
+                    label_bottom + y_shift,
+                    font_size,
+                    fonts,
                 );
-                c.show_text(text).unwrap();
             },
             ButtonImage::Svg(svg) => {
                 let renderer = CairoRenderer::new(&svg);
                 let x = button_left_edge + (button_width as f64 / 2.0 - (ICON_SIZE / 2) as f64).round();
-                let y = y_shift + ((height as f64 - ICON_SIZE as f64) / 2.0).round();
+                let y = y_shift + ((label_top + label_bottom - ICON_SIZE as f64) / 2.0).round();
 
                 renderer.render_document(c,
                     &Rectangle::new(x, y, ICON_SIZE as f64, ICON_SIZE as f64)
@@ -280,7 +375,7 @@ impl Button {
             }
             ButtonImage::Bitmap(surf) => {
                 let x = button_left_edge + (button_width as f64 / 2.0 - (ICON_SIZE / 2) as f64).round();
-                let y = y_shift + ((height as f64 - ICON_SIZE as f64) / 2.0).round();
+                let y = y_shift + ((label_top + label_bottom - ICON_SIZE as f64) / 2.0).round();
                 c.set_source_surface(surf, x, y).unwrap();
                 c.rectangle(x, y, ICON_SIZE as f64, ICON_SIZE as f64);
                 c.fill().unwrap();
@@ -309,12 +404,15 @@ impl Button {
                     current_time.format_localized("%b", current_locale)
                 );
                 }
-                let time_extents = c.text_extents(&formatted_time).unwrap();
-                c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - time_extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + time_extents.height() / 2.0).round()
+                show_label_centered(
+                    c,
+                    &formatted_time,
+                    button_left_edge + button_width as f64 / 2.0,
+                    label_top + y_shift,
+                    label_bottom + y_shift,
+                    font_size,
+                    fonts,
                 );
-                c.show_text(&formatted_time).unwrap();
             }
             _ => {
             }
@@ -327,16 +425,20 @@ impl Button {
         }
     }
 
-    /// Send a single key press+release (tap). Avoids kernel key-repeat if TouchUp is late.
-    fn tap_key<F>(&self, uinput: &mut UInputHandle<F>) where F: AsRawFd {
-        toggle_key(uinput, self.action, 1);
-        toggle_key(uinput, self.action, 0);
+    fn emits_key(&self) -> bool {
+        self.action != Key::Unknown && self.action != Key::Time
+    }
+
+    fn is_interactive(&self) -> bool {
+        self.emits_key() || self.command.is_some() || self.switch_to_layer.is_some()
     }
 
     fn set_active<F>(&mut self, uinput: &mut UInputHandle<F>, active: bool) where F: AsRawFd {
         if self.active != active {
             self.highlight(active);
-            toggle_key(uinput, self.action, active as i32);
+            if self.emits_key() {
+                toggle_key(uinput, self.action, active as i32);
+            }
         }
     }
 }
@@ -375,12 +477,11 @@ impl FunctionLayer {
             c.set_source_rgb(0.0, 0.0, 0.0);
             c.paint().unwrap();
         }
-        if config.font_renderer.to_lowercase() == "cairo" {
-            c.select_font_face(&config.font_style_cairo, if config.italic_cairo {FontSlant::Italic} else {FontSlant::Normal}, if config.bold_cairo {FontWeight::Bold} else {FontWeight::Normal});
-        } else if config.font_renderer.to_lowercase() == "freetype" {
-            c.set_font_face(&config.font_face);
-        } else { panic!("Invalid font renderer chosen. Choose between \"Cairo\" and \"FreeType\""); }
-        c.set_font_size(32.0);
+        const FONT_SIZE: f64 = 32.0;
+        let label_fonts = LabelFonts {
+            primary: &config.font_face,
+            emoji: config.emoji_font_face.as_ref(),
+        };
         for (i, button) in self.buttons.iter_mut().enumerate() {
             if !button.changed && !complete_redraw {
                 continue;
@@ -403,7 +504,7 @@ impl FunctionLayer {
                 }
                 c.fill().unwrap();
             }
-            if (button.action != Key::Unknown &&
+            if (!(button.action == Key::Unknown && !button.is_interactive()) &&
                button.action != Key::Time &&
                button.action != Key::Macro1 &&
                button.action != Key::Macro2 &&
@@ -450,9 +551,27 @@ impl FunctionLayer {
             }
             c.set_source_rgb(1.0, 1.0, 1.0);
             if button.action == Key::Time {
-                button.render(&c, height, left_edge, button_width.ceil() as u64 * 3, pixel_shift_y);
+                button.render(
+                    &c,
+                    left_edge,
+                    button_width.ceil() as u64 * 3,
+                    bot,
+                    top,
+                    pixel_shift_y,
+                    &label_fonts,
+                    FONT_SIZE,
+                );
             } else {
-                button.render(&c, height, left_edge, button_width.ceil() as u64, pixel_shift_y);
+                button.render(
+                    &c,
+                    left_edge,
+                    button_width.ceil() as u64,
+                    bot,
+                    top,
+                    pixel_shift_y,
+                    &label_fonts,
+                    FONT_SIZE,
+                );
             }
 
             button.changed = false;
@@ -520,21 +639,49 @@ fn touchbar_device_name(name: &str) -> bool {
     name.contains(" Touch Bar") || name.contains("iBridge")
 }
 
-fn release_all_held_keys(
-    touches: &mut HashMap<u32, (usize, u32)>,
+struct ActiveTouch {
+    layer: usize,
+    button: u32,
+    pending_command: Option<String>,
+}
+
+fn release_button<F>(
+    uinput: &mut UInputHandle<F>,
     layers: &mut [FunctionLayer],
-) {
-    for (_, (layer, btn)) in touches.drain() {
-        layers[layer].buttons[btn as usize].highlight(false);
+    layer: usize,
+    button: u32,
+) where F: AsRawFd {
+    if let Some(button) = layers
+        .get_mut(layer)
+        .and_then(|layer| layer.buttons.get_mut(button as usize))
+    {
+        button.set_active(uinput, false);
+    }
+}
+
+fn release_all_held_keys<F>(
+    uinput: &mut UInputHandle<F>,
+    touches: &mut HashMap<u32, ActiveTouch>,
+    layers: &mut [FunctionLayer],
+) where F: AsRawFd {
+    for (_, touch) in touches.drain() {
+        release_button(uinput, layers, touch.layer, touch.button);
     }
 }
 
 /// Clear visual highlights that outlived their touch (no matching slot in `touches`).
-fn clear_orphan_highlights(layers: &mut [FunctionLayer]) {
+fn clear_orphan_highlights<F>(
+    uinput: &mut UInputHandle<F>,
+    touches: &HashMap<u32, ActiveTouch>,
+    layers: &mut [FunctionLayer],
+) where F: AsRawFd {
+    if !touches.is_empty() {
+        return;
+    }
     for layer in layers {
         for button in &mut layer.buttons {
             if button.active {
-                button.highlight(false);
+                button.set_active(uinput, false);
             }
         }
     }
@@ -557,7 +704,287 @@ fn toggle_key<F>(uinput: &mut UInputHandle<F>, code: Key, value: i32) where F: A
     emit(uinput, EventKind::Synchronize, SynchronizeKind::Report as u16, 0);
 }
 
+fn run_editor() -> i32 {
+    const EDITOR_SCRIPT: &str = include_str!("../touchbar-layout-editor.py");
+    const RENDER_HELPER: &str = include_str!("../touchbar_render.py");
+
+    let editor_dir = env::temp_dir().join(format!("tiny-dfr-editor-{}", process::id()));
+    if let Err(err) = std::fs::create_dir_all(&editor_dir) {
+        eprintln!("tiny-dfr edit: failed to create {}: {err}", editor_dir.display());
+        return 1;
+    }
+    let editor_path = editor_dir.join("touchbar-layout-editor.py");
+    let helper_path = editor_dir.join("touchbar_render.py");
+    if let Err(err) = std::fs::write(&editor_path, EDITOR_SCRIPT)
+        .and_then(|_| std::fs::write(&helper_path, RENDER_HELPER))
+    {
+        eprintln!("tiny-dfr edit: failed to write embedded editor: {err}");
+        return 1;
+    }
+
+    let status = Command::new("python3")
+        .arg(&editor_path)
+        .env("TINY_DFR_EDITOR_EMBEDDED", "1")
+        .status()
+        .or_else(|_| {
+            Command::new("python")
+                .arg(&editor_path)
+                .env("TINY_DFR_EDITOR_EMBEDDED", "1")
+                .status()
+        });
+
+    match status {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(err) => {
+            eprintln!("tiny-dfr edit: failed to start Python editor: {err}");
+            1
+        }
+    }
+}
+
+fn spawn_command_runner() -> Sender<String> {
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || run_command_worker(rx));
+    tx
+}
+
+fn wayland_session_user() -> Option<(String, u32)> {
+    let entries = std::fs::read_dir("/run/user").ok()?;
+    for entry in entries.flatten() {
+        let uid: u32 = entry.file_name().to_string_lossy().parse().ok()?;
+        if uid < 1000 {
+            continue;
+        }
+        let runtime = entry.path();
+        if !runtime.join("wayland-0").exists() {
+            continue;
+        }
+        let output = Command::new("id")
+            .args(["-nu", &uid.to_string()])
+            .output()
+            .ok()?;
+        let user = String::from_utf8(output.stdout).ok()?;
+        let user = user.trim().to_string();
+        if user.is_empty() {
+            continue;
+        }
+        return Some((user, uid));
+    }
+    None
+}
+
+fn run_shell_command(command: &str) {
+    if let Some((user, uid)) = wayland_session_user() {
+        let runtime = format!("/run/user/{uid}");
+        let mut cmd = Command::new("runuser");
+        cmd.args(["-u", &user, "--", "env"]);
+        cmd.arg(format!("XDG_RUNTIME_DIR={runtime}"));
+        cmd.arg("WAYLAND_DISPLAY=wayland-0");
+        cmd.arg("sh").arg("-c").arg(command);
+        match cmd.status() {
+            Ok(status) if !status.success() => {
+                eprintln!(
+                    "tiny-dfr: command button `{}` exited with {}",
+                    command,
+                    status
+                );
+            }
+            Err(err) => {
+                eprintln!("tiny-dfr: command button failed to start `{}`: {}", command, err);
+            }
+            _ => {}
+        }
+        return;
+    }
+    if let Err(err) = Command::new("sh").arg("-c").arg(command).status() {
+        eprintln!("tiny-dfr: command button failed to start `{}`: {}", command, err);
+    }
+}
+
+fn run_command_worker(rx: Receiver<String>) {
+    while let Ok(command) = rx.recv() {
+        let command = command.trim();
+        if command.is_empty() {
+            continue;
+        }
+        let command = command.to_string();
+        thread::spawn(move || run_shell_command(&command));
+    }
+}
+
+fn init_control_socket() -> Option<UnixDatagram> {
+    let dir = Path::new("/run/tiny-dfr");
+    let path = dir.join("control.sock");
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        eprintln!("tiny-dfr: control socket disabled, cannot create {}: {err}", dir.display());
+        return None;
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            eprintln!("tiny-dfr: control socket disabled, cannot replace {}: {err}", path.display());
+            return None;
+        }
+    }
+    let socket = match UnixDatagram::bind(&path) {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!("tiny-dfr: control socket disabled, bind failed: {err}");
+            return None;
+        }
+    };
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+    if let Err(err) = socket.set_nonblocking(true) {
+        eprintln!("tiny-dfr: control socket disabled, nonblocking failed: {err}");
+        return None;
+    }
+    Some(socket)
+}
+
+fn requested_control_layer(socket: &UnixDatagram) -> Option<usize> {
+    let mut buf = [0u8; 128];
+    let mut requested = None;
+    loop {
+        match socket.recv(&mut buf) {
+            Ok(len) => {
+                let msg = String::from_utf8_lossy(&buf[..len]);
+                let mut parts = msg.split_whitespace();
+                let Some(cmd) = parts.next() else { continue; };
+                if cmd.eq_ignore_ascii_case("layer") || cmd.eq_ignore_ascii_case("bar") {
+                    if let Some(layer) = parts.next().and_then(|part| part.parse::<usize>().ok()) {
+                        requested = Some(layer);
+                    }
+                } else if cmd.eq_ignore_ascii_case("default") {
+                    requested = Some(0);
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+            Err(err) => {
+                eprintln!("tiny-dfr: control socket read failed: {err}");
+                break;
+            }
+        }
+    }
+    requested
+}
+
+fn mark_layer_dirty(layers: &mut [FunctionLayer], layer: usize) {
+    if let Some(layer) = layers.get_mut(layer) {
+        for button in &mut layer.buttons {
+            button.changed = true;
+        }
+    }
+}
+
+fn mark_all_layers_dirty(layers: &mut [FunctionLayer]) {
+    for layer in layers.iter_mut() {
+        for button in &mut layer.buttons {
+            button.changed = true;
+        }
+    }
+}
+
+fn resolve_layer_index(requested_layer: usize, layer_count: usize) -> Option<usize> {
+    if requested_layer < layer_count {
+        Some(requested_layer)
+    } else {
+        eprintln!(
+            "tiny-dfr: SwitchToLayer {requested_layer} is invalid (layers 0..{})",
+            layer_count.saturating_sub(1)
+        );
+        None
+    }
+}
+
+fn set_active_layer<F>(
+    uinput: &mut UInputHandle<F>,
+    touches: &mut HashMap<u32, ActiveTouch>,
+    layers: &mut [FunctionLayer],
+    active_layer: &mut usize,
+    requested_layer: usize,
+    needs_complete_redraw: &mut bool,
+    release_keys: bool,
+) where F: AsRawFd {
+    let Some(new_layer) = resolve_layer_index(requested_layer, layers.len()) else {
+        return;
+    };
+    if *active_layer != new_layer {
+        if release_keys {
+            release_all_held_keys(uinput, touches, layers);
+        }
+        *active_layer = new_layer;
+    }
+    mark_layer_dirty(layers, new_layer);
+    *needs_complete_redraw = true;
+}
+
+/// App/custom bars (layer index >= 2). Layers 0/1 are the default ↔ Fn pair only.
+fn apply_layer_selection<F>(
+    uinput: &mut UInputHandle<F>,
+    touches: &mut HashMap<u32, ActiveTouch>,
+    layers: &mut [FunctionLayer],
+    active_layer: &mut usize,
+    overlay_layer: &mut Option<usize>,
+    fn_toggle_active: &mut bool,
+    fn_layer: usize,
+    requested_layer: usize,
+    needs_complete_redraw: &mut bool,
+    release_keys: bool,
+) where F: AsRawFd {
+    let Some(new_layer) = resolve_layer_index(requested_layer, layers.len()) else {
+        return;
+    };
+    if new_layer <= 1 {
+        *overlay_layer = None;
+        *fn_toggle_active = new_layer == fn_layer;
+    } else {
+        *overlay_layer = Some(new_layer);
+    }
+    set_active_layer(
+        uinput,
+        touches,
+        layers,
+        active_layer,
+        new_layer,
+        needs_complete_redraw,
+        release_keys,
+    );
+}
+
+fn baseline_layer(
+    overlay_layer: Option<usize>,
+    fn_toggle_active: bool,
+    default_layer: usize,
+    fn_layer: usize,
+) -> usize {
+    if let Some(layer) = overlay_layer {
+        return layer;
+    }
+    fn_toggle_target(fn_toggle_active, default_layer, fn_layer)
+}
+
+fn fn_toggle_target(fn_toggle_active: bool, default_layer: usize, fn_layer: usize) -> usize {
+    if fn_toggle_active {
+        fn_layer
+    } else {
+        default_layer
+    }
+}
+
+fn layer_for_shortcut(cfg: &Config, key: u32, fn_pressed: bool, modifiers: &KeyboardModifiers) -> Option<usize> {
+    cfg.layer_shortcuts
+        .iter()
+        .filter(|shortcut| shortcut.matches(key, fn_pressed, modifiers))
+        .max_by_key(|shortcut| shortcut.match_priority())
+        .map(|shortcut| shortcut.layer)
+}
+
 fn main() {
+    if env::args().skip(1).any(|arg| arg == "edit" || arg == "--edit") {
+        process::exit(run_editor());
+    }
+
     let drm = match DrmBackend::open_card() {
         Ok(drm) => drm,
         Err(err) => {
@@ -603,7 +1030,10 @@ fn real_main(
     db_height: u32,
 ) {
     let mut cfg_mgr = ConfigManager::new();
-    let (mut cfg, mut layers) = cfg_mgr.load_config(width);
+    let (mut cfg, mut layers) = cfg_mgr.load_config(width).unwrap_or_else(|err| {
+        eprintln!("tiny-dfr: failed to load configuration: {err}");
+        process::exit(1);
+    });
 
     // Open sysfs backlights as root before privdrop (nodes are root-only on many systems).
     let mut backlight = BacklightManager::new();
@@ -611,7 +1041,9 @@ fn real_main(
     uinput.set_evbit(EventKind::Key).unwrap();
     for layer in &layers {
         for button in &layer.buttons {
-            uinput.set_keybit(button.action).unwrap();
+            if button.emits_key() {
+                uinput.set_keybit(button.action).unwrap();
+            }
         }
     }
     let mut dev_name_c = [0 as c_char; 80];
@@ -631,11 +1063,23 @@ fn real_main(
     }).unwrap();
     uinput.dev_create().unwrap();
 
-    PrivDrop::default()
-        .user("nobody")
-        .group_list(&["input", "video"])
-        .apply()
-        .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
+    let command_tx = if cfg.allow_root_commands {
+        eprintln!(
+            "tiny-dfr: AllowRootCommands=true; command buttons execute as root. Only use trusted config."
+        );
+        Some(spawn_command_runner())
+    } else {
+        None
+    };
+    let control_socket = init_control_socket();
+
+    if !cfg.allow_root_commands {
+        PrivDrop::default()
+            .user("nobody")
+            .group_list(&["input", "video"])
+            .apply()
+            .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
+    }
 
     let mut last_redraw_minute = Local::now().minute();
     let mut pixel_shift = PixelShiftManager::new();
@@ -667,11 +1111,28 @@ fn real_main(
 
     let default_layer: usize = 0;
     let fn_layer: usize = 1;
-    let mut touches: HashMap<u32, (usize, u32)> = HashMap::new();
+    let mut touches: HashMap<u32, ActiveTouch> = HashMap::new();
+    let mut fn_pressed = false;
+    let mut fn_pressed_at: Option<Instant> = None;
+    let mut fn_toggle_active = false;
+    let mut fn_shortcut_used = false;
+    let mut keyboard_modifiers = KeyboardModifiers::default();
+    let mut overlay_layer: Option<usize> = None;
+    let mut last_drawn_layer = usize::MAX;
     loop {
         if cfg_mgr.update_config(&mut cfg, &mut layers, width) {
-            release_all_held_keys(&mut touches, &mut layers);
+            release_all_held_keys(&mut uinput, &mut touches, &mut layers);
             active_layer = default_layer;
+            fn_pressed = false;
+            fn_pressed_at = None;
+            fn_toggle_active = false;
+            fn_shortcut_used = false;
+            overlay_layer = None;
+            last_drawn_layer = usize::MAX;
+            needs_complete_redraw = true;
+        }
+
+        if active_layer != last_drawn_layer {
             needs_complete_redraw = true;
         }
 
@@ -729,29 +1190,187 @@ fn real_main(
                         digitizer = Some(dev);
                     }
                 },
+                Event::Device(DeviceEvent::Removed(evt)) => {
+                    if Some(evt.device()) == digitizer {
+                        release_all_held_keys(&mut uinput, &mut touches, &mut layers);
+                        digitizer = None;
+                        needs_complete_redraw = true;
+                    }
+                },
                 Event::Keyboard(KeyboardEvent::Key(key)) => {
-                    if key.key() == Key::Fn as u32 {
-                        let new_layer = match key.key_state() {
-                            KeyState::Pressed => fn_layer,
-                            KeyState::Released => default_layer,
-                        };
-                        if active_layer != new_layer {
-                            release_all_held_keys(&mut touches, &mut layers);
-                            active_layer = new_layer;
-                            needs_complete_redraw = true;
+                    let key_code = key.key();
+                    if key_code != Key::Fn as u32 {
+                        keyboard_modifiers.update(key_code, key.key_state() == KeyState::Pressed);
+                    }
+                    if key_code == Key::Fn as u32 {
+                        match key.key_state() {
+                            KeyState::Pressed => {
+                                fn_pressed = true;
+                                fn_pressed_at = Some(Instant::now());
+                                fn_shortcut_used = false;
+                                match cfg.fn_mode {
+                                    FnMode::Hold | FnMode::Smart => set_active_layer(
+                                        &mut uinput,
+                                        &mut touches,
+                                        &mut layers,
+                                        &mut active_layer,
+                                        fn_layer,
+                                        &mut needs_complete_redraw,
+                                        true,
+                                    ),
+                                    FnMode::Toggle => {
+                                        fn_toggle_active = !fn_toggle_active;
+                                        set_active_layer(
+                                            &mut uinput,
+                                            &mut touches,
+                                            &mut layers,
+                                            &mut active_layer,
+                                            fn_toggle_target(
+                                                fn_toggle_active,
+                                                default_layer,
+                                                fn_layer,
+                                            ),
+                                            &mut needs_complete_redraw,
+                                            true,
+                                        );
+                                    }
+                                }
+                            }
+                            KeyState::Released => {
+                                fn_pressed = false;
+                                if !fn_shortcut_used {
+                                    match cfg.fn_mode {
+                                        FnMode::Hold => set_active_layer(
+                                            &mut uinput,
+                                            &mut touches,
+                                            &mut layers,
+                                            &mut active_layer,
+                                            baseline_layer(
+                                                overlay_layer,
+                                                fn_toggle_active,
+                                                default_layer,
+                                                fn_layer,
+                                            ),
+                                            &mut needs_complete_redraw,
+                                            true,
+                                        ),
+                                        FnMode::Smart => {
+                                            let elapsed = fn_pressed_at
+                                                .map(|instant| instant.elapsed())
+                                                .unwrap_or(Duration::from_millis(u64::MAX));
+                                            let quick_tap = elapsed
+                                                <= Duration::from_millis(cfg.fn_toggle_press_ms);
+                                            if quick_tap {
+                                                fn_toggle_active = !fn_toggle_active;
+                                                set_active_layer(
+                                                    &mut uinput,
+                                                    &mut touches,
+                                                    &mut layers,
+                                                    &mut active_layer,
+                                                    fn_toggle_target(
+                                                        fn_toggle_active,
+                                                        default_layer,
+                                                        fn_layer,
+                                                    ),
+                                                    &mut needs_complete_redraw,
+                                                    true,
+                                                );
+                                            } else {
+                                                set_active_layer(
+                                                    &mut uinput,
+                                                    &mut touches,
+                                                    &mut layers,
+                                                    &mut active_layer,
+                                                    baseline_layer(
+                                                        overlay_layer,
+                                                        fn_toggle_active,
+                                                        default_layer,
+                                                        fn_layer,
+                                                    ),
+                                                    &mut needs_complete_redraw,
+                                                    true,
+                                                );
+                                            }
+                                        }
+                                        FnMode::Toggle => {}
+                                    }
+                                }
+                                fn_pressed_at = None;
+                                fn_shortcut_used = false;
+                            }
                         }
-                    } else if key.key() == Key::Macro1 as u32 && key.key_state() == KeyState::Pressed {
-                        release_all_held_keys(&mut touches, &mut layers);
-                        active_layer = if cfg.media_layer_default { default_layer } else { fn_layer };
-                        needs_complete_redraw = true;
-                    } else if key.key() == Key::Macro2 as u32 && key.key_state() == KeyState::Pressed {
-                        release_all_held_keys(&mut touches, &mut layers);
-                        active_layer = 2;
-                        needs_complete_redraw = true;
-                    } else if key.key() == Key::Macro3 as u32 && key.key_state() == KeyState::Pressed {
-                        release_all_held_keys(&mut touches, &mut layers);
-                        active_layer = 3;
-                        needs_complete_redraw = true;
+                    } else if key.key_state() == KeyState::Pressed {
+                        if cfg.redraw_shortcut.matches(
+                            key_code,
+                            fn_pressed,
+                            &keyboard_modifiers,
+                            false,
+                        ) {
+                            mark_all_layers_dirty(&mut layers);
+                            needs_complete_redraw = true;
+                        } else if let Some(layer) = layer_for_shortcut(
+                            &cfg,
+                            key_code,
+                            fn_pressed,
+                            &keyboard_modifiers,
+                        ) {
+                            fn_shortcut_used = true;
+                            apply_layer_selection(
+                                &mut uinput,
+                                &mut touches,
+                                &mut layers,
+                                &mut active_layer,
+                                &mut overlay_layer,
+                                &mut fn_toggle_active,
+                                fn_layer,
+                                layer,
+                                &mut needs_complete_redraw,
+                                true,
+                            );
+                        } else if key_code == Key::Macro1 as u32 {
+                            apply_layer_selection(
+                                &mut uinput,
+                                &mut touches,
+                                &mut layers,
+                                &mut active_layer,
+                                &mut overlay_layer,
+                                &mut fn_toggle_active,
+                                fn_layer,
+                                if cfg.media_layer_default {
+                                    default_layer
+                                } else {
+                                    fn_layer
+                                },
+                                &mut needs_complete_redraw,
+                                true,
+                            );
+                        } else if key_code == Key::Macro2 as u32 {
+                            apply_layer_selection(
+                                &mut uinput,
+                                &mut touches,
+                                &mut layers,
+                                &mut active_layer,
+                                &mut overlay_layer,
+                                &mut fn_toggle_active,
+                                fn_layer,
+                                2,
+                                &mut needs_complete_redraw,
+                                true,
+                            );
+                        } else if key_code == Key::Macro3 as u32 {
+                            apply_layer_selection(
+                                &mut uinput,
+                                &mut touches,
+                                &mut layers,
+                                &mut active_layer,
+                                &mut overlay_layer,
+                                &mut fn_toggle_active,
+                                fn_layer,
+                                3,
+                                &mut needs_complete_redraw,
+                                true,
+                            );
+                        }
                     }
                 },
                 Event::Touch(te) => {
@@ -760,30 +1379,60 @@ fn real_main(
                     }
                     match te {
                         TouchEvent::Down(dn) => {
+                            let slot = dn.seat_slot();
+                            if let Some(previous) = touches.remove(&slot) {
+                                release_button(&mut uinput, &mut layers, previous.layer, previous.button);
+                            }
                             let x = dn.x_transformed(width as u32);
                             let num = layers[active_layer].buttons.len() as u32;
                             let Some(btn) = button_at_x(num, width, x) else {
                                 continue;
                             };
                             let button = &mut layers[active_layer].buttons[btn as usize];
-                            if button.action == Key::Unknown || button.action == Key::Time {
+                            if !button.is_interactive() {
                                 continue;
                             }
-                            touches.insert(dn.seat_slot(), (active_layer, btn));
-                            // Same path as volume/play: uinput KEY_BRIGHTNESS* so GNOME/UPower
-                            // handles brightness and shows the on-screen notification.
-                            button.tap_key(&mut uinput);
-                            button.highlight(true);
+                            let command = button.command.clone();
+                            let switch_to_layer = button.switch_to_layer;
+                            let touch_layer = active_layer;
+                            button.set_active(&mut uinput, true);
+                            if let Some(layer) = switch_to_layer {
+                                apply_layer_selection(
+                                    &mut uinput,
+                                    &mut touches,
+                                    &mut layers,
+                                    &mut active_layer,
+                                    &mut overlay_layer,
+                                    &mut fn_toggle_active,
+                                    fn_layer,
+                                    layer,
+                                    &mut needs_complete_redraw,
+                                    false,
+                                );
+                            }
+                            touches.insert(slot, ActiveTouch {
+                                layer: touch_layer,
+                                button: btn,
+                                pending_command: command,
+                            });
                         },
                         TouchEvent::Up(up) => {
-                            let Some((layer, btn)) = touches.remove(&up.seat_slot()) else {
+                            let Some(touch) = touches.remove(&up.seat_slot()) else {
                                 continue;
                             };
-                            let button = &mut layers[layer].buttons[btn as usize];
-                            if button.action == Key::Unknown || button.action == Key::Time {
-                                continue;
+                            release_button(&mut uinput, &mut layers, touch.layer, touch.button);
+                            if let Some(command) = touch.pending_command {
+                                if let Some(tx) = &command_tx {
+                                    let _ = tx.send(command);
+                                } else {
+                                    eprintln!(
+                                        "tiny-dfr: command button ignored because AllowRootCommands=false"
+                                    );
+                                }
                             }
-                            button.highlight(false);
+                        },
+                        TouchEvent::Cancel(_) => {
+                            release_all_held_keys(&mut uinput, &mut touches, &mut layers);
                         },
                         // Ignore motion: no key or redraw churn from finger jitter.
                         _ => {}
@@ -793,12 +1442,28 @@ fn real_main(
             }
             }
         }
-        if touches.is_empty() {
-            clear_orphan_highlights(&mut layers);
+        if let Some(socket) = &control_socket {
+            if let Some(layer) = requested_control_layer(socket) {
+                apply_layer_selection(
+                    &mut uinput,
+                    &mut touches,
+                    &mut layers,
+                    &mut active_layer,
+                    &mut overlay_layer,
+                    &mut fn_toggle_active,
+                    fn_layer,
+                    layer,
+                    &mut needs_complete_redraw,
+                    true,
+                );
+            }
         }
+        clear_orphan_highlights(&mut uinput, &touches, &mut layers);
         backlight.update_backlight(&cfg);
 
-        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.changed) {
+        let layer_changed = active_layer != last_drawn_layer;
+        let complete_redraw = needs_complete_redraw || layer_changed;
+        if complete_redraw || layers[active_layer].buttons.iter().any(|b| b.changed) {
             let shift = if cfg.enable_pixel_shift {
                 pixel_shift.get()
             } else {
@@ -810,10 +1475,11 @@ fn real_main(
                 height as i32,
                 &surface,
                 shift,
-                needs_complete_redraw,
+                complete_redraw,
             );
             let data = surface.data().unwrap();
             redraw.try_push(data.to_vec(), clips);
+            last_drawn_layer = active_layer;
             needs_complete_redraw = false;
         }
     }

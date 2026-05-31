@@ -1,23 +1,20 @@
-use std::{
-    fs::{File, OpenOptions, self},
-    path::{PathBuf, Path},
-    time::{Duration, Instant},
-    io::Write,
-    cmp::min,
-};
-use anyhow::{Result, anyhow};
+use crate::config::Config;
+use anyhow::{anyhow, Result};
 use input::event::{
-    Event, switch::{Switch, SwitchEvent, SwitchState},
+    switch::{Switch, SwitchEvent, SwitchState},
+    Event,
 };
 use input_linux::Key;
-use crate::config::Config;
-use crate::TIMEOUT_MS;
+use std::{
+    cmp::min,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 const MAX_DISPLAY_BRIGHTNESS: u32 = 509;
 const MAX_TOUCH_BAR_BRIGHTNESS: u32 = 255;
-const BRIGHTNESS_DIM_TIMEOUT: i32 = TIMEOUT_MS * 3; // should be a multiple of TIMEOUT_MS
-const BRIGHTNESS_OFF_TIMEOUT: i32 = TIMEOUT_MS * 6; // should be a multiple of TIMEOUT_MS
-const DIMMED_BRIGHTNESS: u32 = 1;
 /// After any brightness/illum adjustment, don't touch HID-backed touchbar backlight.
 const BRIGHTNESS_PAUSE_MS: u64 = 3000;
 /// Touchbar illumination sysfs writes each trigger slow HID; throttle them.
@@ -37,7 +34,10 @@ fn find_backlight() -> Result<PathBuf> {
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
 
-        if ["display-pipe", "appletb_backlight"].iter().any(|s| name.contains(s)) {
+        if ["display-pipe", "appletb_backlight"]
+            .iter()
+            .any(|s| name.contains(s))
+        {
             return Ok(entry.path());
         }
     }
@@ -47,7 +47,15 @@ fn find_backlight() -> Result<PathBuf> {
 fn find_display_backlight() -> Result<PathBuf> {
     for entry in fs::read_dir("/sys/class/backlight/")? {
         let entry = entry?;
-        if ["apple-panel-bl", "gmux_backlight", "intel_backlight", "acpi_video0"].iter().any(|s| entry.file_name().to_string_lossy().contains(s)) {
+        if [
+            "apple-panel-bl",
+            "gmux_backlight",
+            "intel_backlight",
+            "acpi_video0",
+        ]
+        .iter()
+        .any(|s| entry.file_name().to_string_lossy().contains(s))
+        {
             return Ok(entry.path());
         }
     }
@@ -76,7 +84,10 @@ impl BacklightManager {
     pub fn new() -> BacklightManager {
         let bl_path = find_backlight().unwrap();
         let display_bl_path = find_display_backlight().unwrap();
-        let bl_file = OpenOptions::new().write(true).open(bl_path.join("brightness")).unwrap();
+        let bl_file = OpenOptions::new()
+            .write(true)
+            .open(bl_path.join("brightness"))
+            .unwrap();
         let display_bl_max = read_attr(&display_bl_path, "max_brightness");
         let display_bl_file = OpenOptions::new()
             .write(true)
@@ -165,19 +176,17 @@ impl BacklightManager {
         match event {
             Event::Keyboard(_) | Event::Pointer(_) | Event::Gesture(_) | Event::Touch(_) => {
                 self.last_active = Instant::now();
-            },
-            Event::Switch(SwitchEvent::Toggle(toggle)) => {
-                match toggle.switch() {
-                    Some(Switch::Lid) => {
-                        self.lid_state = toggle.switch_state();
-                        println!("Lid Switch event: {:?}", self.lid_state);
-                        if toggle.switch_state() == SwitchState::Off {
-                            self.last_active = Instant::now();
-                        }
-                    }
-                    _ => {}
-                }
             }
+            Event::Switch(SwitchEvent::Toggle(toggle)) => match toggle.switch() {
+                Some(Switch::Lid) => {
+                    self.lid_state = toggle.switch_state();
+                    println!("Lid Switch event: {:?}", self.lid_state);
+                    if toggle.switch_state() == SwitchState::Off {
+                        self.last_active = Instant::now();
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -186,18 +195,21 @@ impl BacklightManager {
             return;
         }
         let since_last_active = (Instant::now() - self.last_active).as_millis() as u64;
-        let new_bl = min(self.max_bl, if self.lid_state == SwitchState::On {
-            0
-        } else if since_last_active < BRIGHTNESS_DIM_TIMEOUT as u64 {
-            // Never mirror display brightness onto the touchbar here: each sysfs write
-            // triggers slow HID traffic on T1 and blocks other touchbar I/O.
-            let _ = cfg.adaptive_brightness;
-            cfg.active_brightness
-        } else if since_last_active < BRIGHTNESS_OFF_TIMEOUT as u64 {
-            DIMMED_BRIGHTNESS
-        } else {
-            0
-        });
+        let new_bl = min(
+            self.max_bl,
+            if self.lid_state == SwitchState::On {
+                0
+            } else if since_last_active < cfg.dim_timeout_ms {
+                // Never mirror display brightness onto the touchbar here: each sysfs write
+                // triggers slow HID traffic on T1 and blocks other touchbar I/O.
+                let _ = cfg.adaptive_brightness;
+                cfg.active_brightness
+            } else if since_last_active < cfg.off_timeout_ms {
+                cfg.dimmed_brightness
+            } else {
+                0
+            },
+        );
         if self.current_bl != new_bl {
             self.current_bl = new_bl;
             set_backlight(&self.bl_file, self.current_bl);

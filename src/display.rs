@@ -1,5 +1,16 @@
+use anyhow::{anyhow, Result};
+use drm::{
+    buffer::DrmFourcc,
+    control::{
+        atomic, connector,
+        dumbbuffer::{DumbBuffer, DumbMapping},
+        framebuffer, property, AtomicCommitFlags, ClipRect, Device as ControlDevice, Mode,
+        ResourceHandle,
+    },
+    ClientCapability, Device as DrmDevice,
+};
 use std::{
-    fs::{File, OpenOptions, self},
+    fs::{self, File, OpenOptions},
     io,
     os::unix::io::{AsFd, BorrowedFd},
     path::{Path, PathBuf},
@@ -7,14 +18,6 @@ use std::{
     thread,
     time::Duration,
 };
-use drm::{
-    ClientCapability, Device as DrmDevice, buffer::DrmFourcc,
-    control::{
-        connector, Device as ControlDevice, property, ResourceHandle, atomic, AtomicCommitFlags,
-        dumbbuffer::{DumbBuffer, DumbMapping}, framebuffer, ClipRect, Mode
-    }
-};
-use anyhow::{Result, anyhow};
 
 struct Card(File);
 impl AsFd for Card {
@@ -23,7 +26,11 @@ impl AsFd for Card {
     }
 }
 
-fn log_object_properties<T: ResourceHandle + std::fmt::Debug>(card: &Card, label: &str, handle: T) -> Result<()> {
+fn log_object_properties<T: ResourceHandle + std::fmt::Debug>(
+    card: &Card,
+    label: &str,
+    handle: T,
+) -> Result<()> {
     let props = card.get_properties(handle)?;
     let (prop_ids, prop_values) = props.as_props_and_values();
     eprintln!("{label} {:?} has {} properties", handle, prop_ids.len());
@@ -42,10 +49,16 @@ fn log_object_properties<T: ResourceHandle + std::fmt::Debug>(card: &Card, label
 }
 
 fn pick_primary_format(plane_formats: &[u32]) -> Option<DrmFourcc> {
-    if plane_formats.iter().any(|f| *f == DrmFourcc::Argb8888 as u32) {
+    if plane_formats
+        .iter()
+        .any(|f| *f == DrmFourcc::Argb8888 as u32)
+    {
         return Some(DrmFourcc::Argb8888);
     }
-    if plane_formats.iter().any(|f| *f == DrmFourcc::Xrgb8888 as u32) {
+    if plane_formats
+        .iter()
+        .any(|f| *f == DrmFourcc::Xrgb8888 as u32)
+    {
         return Some(DrmFourcc::Xrgb8888);
     }
     None
@@ -67,7 +80,7 @@ pub struct DrmBackend {
     card: Card,
     mode: Mode,
     db: DumbBuffer,
-    fb: framebuffer::Handle
+    fb: framebuffer::Handle,
 }
 
 impl Drop for DrmBackend {
@@ -76,7 +89,6 @@ impl Drop for DrmBackend {
         self.card.destroy_dumb_buffer(self.db).unwrap();
     }
 }
-
 
 fn find_prop_id<T: ResourceHandle>(
     card: &Card,
@@ -107,7 +119,10 @@ fn find_optional_prop<T: ResourceHandle>(
     Ok(None)
 }
 
-fn find_enum_value<'a>(values: &'a property::EnumValues, names: &[&str]) -> Option<&'a property::EnumValue> {
+fn find_enum_value<'a>(
+    values: &'a property::EnumValues,
+    names: &[&str],
+) -> Option<&'a property::EnumValue> {
     let (_, enums) = values.values();
     names.iter().find_map(|target| {
         enums.iter().find(|candidate| {
@@ -162,7 +177,6 @@ fn try_open_card(path: &Path) -> Result<DrmBackend> {
     card.set_client_capability(ClientCapability::UniversalPlanes, true)?;
     card.set_client_capability(ClientCapability::Atomic, true)?;
 
-
     let res = card.resource_handles()?;
     let coninfo = res
         .connectors()
@@ -190,7 +204,10 @@ fn try_open_card(path: &Path) -> Result<DrmBackend> {
         })
         .max_by_key(|(_, mode)| {
             let (width, height) = mode.size();
-            ((u32::from(width) * 1000) / u32::from(height).max(1), u32::from(width))
+            (
+                (u32::from(width) * 1000) / u32::from(height).max(1),
+                u32::from(width),
+            )
         })
         .ok_or(anyhow!("No connected touchbar-like connectors found"))?;
 
@@ -205,7 +222,10 @@ fn try_open_card(path: &Path) -> Result<DrmBackend> {
     if possible_crtcs.is_empty() {
         possible_crtcs = res.crtcs().to_vec();
     }
-    let crtc = possible_crtcs.first().copied().ok_or(anyhow!("No crtcs found"))?;
+    let crtc = possible_crtcs
+        .first()
+        .copied()
+        .ok_or(anyhow!("No crtcs found"))?;
     let (plane, fmt) = card
         .plane_handles()?
         .iter()
@@ -233,11 +253,7 @@ fn try_open_card(path: &Path) -> Result<DrmBackend> {
     );
     let blob = card.create_property_blob(&mode)?;
 
-    atomic_req.add_property(
-        crtc,
-        find_prop_id(&card, crtc, "MODE_ID")?,
-        blob,
-    );
+    atomic_req.add_property(crtc, find_prop_id(&card, crtc, "MODE_ID")?, blob);
     atomic_req.add_property(
         crtc,
         find_prop_id(&card, crtc, "ACTIVE")?,
@@ -307,7 +323,10 @@ fn try_open_card(path: &Path) -> Result<DrmBackend> {
 
     if let Some((prop, info)) = find_optional_prop(&card, plane, "pixel blend mode")? {
         if let property::ValueType::Enum(values) = info.value_type() {
-            if let Some(enum_value) = find_enum_value(&values, &["Pre-multiplied", "Premultiplied", "Coverage", "None"]) {
+            if let Some(enum_value) = find_enum_value(
+                &values,
+                &["Pre-multiplied", "Premultiplied", "Coverage", "None"],
+            ) {
                 atomic_req.add_property(plane, prop, property::Value::Enum(Some(enum_value)));
             }
         }
@@ -345,7 +364,6 @@ fn try_open_card(path: &Path) -> Result<DrmBackend> {
         eprintln!("tiny-dfr: atomic commit failed: {err:?}");
         return Err(err.into());
     }
-
 
     Ok(DrmBackend { card, mode, db, fb })
 }
